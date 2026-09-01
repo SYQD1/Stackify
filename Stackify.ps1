@@ -1117,13 +1117,21 @@ function Test-TweakApplied {
     return $true
 }
 
-$ctrl.GetInstalledTweaksBtn.Add_Click({
+function Sync-TweaksToSystemState {
     foreach ($kv in $TweakCheckboxes.GetEnumerator()) {
         $tw = $Tweaks.($kv.Key)
         try { $kv.Value.IsChecked = (Test-TweakApplied -Tw $tw) } catch { $kv.Value.IsChecked = $false }
     }
     Update-TweakCount
-})
+}
+
+$ctrl.GetInstalledTweaksBtn.Add_Click({ Sync-TweaksToSystemState })
+
+# Reflect the machine's real current state as soon as the Tweaks tab is
+# built, rather than only after an explicit "Get Installed Tweaks" click -
+# every toggle/checkbox already knows how to detect this (Test-TweakApplied
+# reads the real registry values), it just wasn't being run automatically.
+Sync-TweaksToSystemState
 
 # "AppX Removal" - a small companion window listing installed AppX
 # packages with a Remove Selected action.
