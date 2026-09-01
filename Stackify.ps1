@@ -1239,21 +1239,46 @@ function Test-Choco {
     return [bool](Get-Command choco -ErrorAction SilentlyContinue)
 }
 
+# A plain synchronous Process.Start + ReadToEnd()/WaitForExit() here blocks
+# whichever thread calls it for the entire install duration - and every
+# caller of this function runs on the UI thread, so a real install (which
+# can run for tens of seconds to minutes) would freeze the whole window and
+# Windows would mark it "Not Responding", even though it's actually still
+# working. Runs the process on a background runspace instead and pumps
+# DoEvents while waiting, so the window stays responsive and paints
+# normally throughout - same pattern already used for icon downloads.
+$script:ProcessRunspacePool = [runspacefactory]::CreateRunspacePool(1, 4)
+$script:ProcessRunspacePool.Open()
+
 function Invoke-ProcessSilently {
     param([string]$FileName, [string[]]$ArgList)
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FileName
-    $psi.Arguments = ($ArgList -join ' ')
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WindowStyle = 'Hidden'
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
-    $err = $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
-    return @{ Output = "$out`r`n$err"; ExitCode = $p.ExitCode }
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:ProcessRunspacePool
+    [void]$ps.AddScript({
+        param($FileName, $ArgList)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FileName
+        $psi.Arguments = ($ArgList -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = 'Hidden'
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        return @{ Output = "$out`r`n$err"; ExitCode = $p.ExitCode }
+    }).AddArgument($FileName).AddArgument($ArgList)
+
+    $handle = $ps.BeginInvoke()
+    while (-not $handle.IsCompleted) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 50
+    }
+    $result = $ps.EndInvoke($handle)
+    $ps.Dispose()
+    return $result[0]
 }
 function Invoke-WingetSilently { param([string[]]$ArgList) Invoke-ProcessSilently -FileName 'winget' -ArgList $ArgList }
 function Invoke-ChocoSilently  { param([string[]]$ArgList) Invoke-ProcessSilently -FileName 'choco'  -ArgList $ArgList }
