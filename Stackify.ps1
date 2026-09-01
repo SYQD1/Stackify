@@ -564,6 +564,17 @@ function Get-IconDownloadUrl { param([string]$Key)
     return "https://www.google.com/s2/favicons?sz=64&domain=$domain"
 }
 
+# Google's favicon service 404s (with a generic placeholder image bundled in
+# the body, which WebClient never even sees since it throws on non-2xx) for
+# some real, working sites - e.g. videolan.org (VLC), apparently sites its
+# crawler hasn't indexed. When that happens, fetch the domain's own
+# favicon.ico directly as a second attempt before giving up to a badge.
+function Get-IconFallbackUrl { param([string]$Key)
+    if ($Key.StartsWith('app:')) { return $null }
+    $domain = $Key.Substring(7)
+    return "https://$domain/favicon.ico"
+}
+
 function Get-CachedIconFile { param([string]$Key)
     $safe = ($Key -replace '[^a-zA-Z0-9\.\-]', '_')
     return (Join-Path $IconCacheDir "$safe.png")
@@ -639,21 +650,28 @@ function Start-IconDownloadsAsync {
 
         $url = Get-IconDownloadUrl -Key $key
         if ([string]::IsNullOrWhiteSpace($url)) { continue }
+        $fallbackUrl = Get-IconFallbackUrl -Key $key
 
         $ps = [powershell]::Create()
         $ps.RunspacePool = $script:IconRunspacePool
         [void]$ps.AddScript({
-            param($Key, $Url, $Queue, $CacheFile)
-            try {
-                $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add('User-Agent', 'Mozilla/5.0')
-                $bytes = $wc.DownloadData($Url)
-                if ($bytes -and $bytes.Length -gt 0) {
-                    try { [IO.File]::WriteAllBytes($CacheFile, $bytes) } catch {}
-                    $Queue.Enqueue([pscustomobject]@{ Key = $Key; Bytes = $bytes })
-                }
-            } catch {}
-        }).AddArgument($key).AddArgument($url).AddArgument($script:IconResultQueue).AddArgument($cacheFile)
+            param($Key, $Url, $FallbackUrl, $Queue, $CacheFile)
+            function Try-Download { param($U)
+                try {
+                    $wc = New-Object System.Net.WebClient
+                    $wc.Headers.Add('User-Agent', 'Mozilla/5.0')
+                    $bytes = $wc.DownloadData($U)
+                    if ($bytes -and $bytes.Length -gt 0) { return $bytes }
+                } catch {}
+                return $null
+            }
+            $bytes = Try-Download -U $Url
+            if (-not $bytes -and $FallbackUrl) { $bytes = Try-Download -U $FallbackUrl }
+            if ($bytes) {
+                try { [IO.File]::WriteAllBytes($CacheFile, $bytes) } catch {}
+                $Queue.Enqueue([pscustomobject]@{ Key = $Key; Bytes = $bytes })
+            }
+        }).AddArgument($key).AddArgument($url).AddArgument($fallbackUrl).AddArgument($script:IconResultQueue).AddArgument($cacheFile)
         $handle = $ps.BeginInvoke()
         $script:IconJobs.Add(@{ PS = $ps; Handle = $handle }) | Out-Null
     }
