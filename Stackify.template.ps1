@@ -928,7 +928,99 @@ $ctrl.UpgradeAllBtn.Add_Click({
 # Build the Tweaks tab: Essential + Advanced (left column, checkboxes) and
 # Customize Preferences (right column, toggle switches).
 # ---------------------------------------------------------------------------
+# Set-RegistryValue and Invoke-Tweak are defined here, before the toggle
+# rows below are built - not just organizationally. New-TweakToggleRow's
+# instant-apply click handlers are created via .GetNewClosure(), which
+# snapshots the function table available at that exact moment; a function
+# defined later in the script (as these originally were, further down near
+# Run-TweaksJob) would not exist yet in that snapshot, and every toggle
+# click would fail with "Invoke-Tweak is not recognized..." silently
+# swallowed by the handler's own try/catch. Confirmed this failure mode by
+# temporarily logging the caught exception before moving these up.
+function Set-RegistryValue {
+    param($Path, $Name, $Value, $Type)
+    if ($Value -eq '<RemoveEntry>') {
+        Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        return
+    }
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    $propType = switch ($Type) {
+        'DWord'  { 'DWord' }
+        'QWord'  { 'QWord' }
+        'String' { 'String' }
+        default  { 'String' }
+    }
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $propType -Force | Out-Null
+}
+
+function Invoke-Tweak {
+    param($TweakId, [switch]$Undo, $OutBox)
+
+    # $OutBox is optional - the Customize Preferences toggles apply/undo
+    # instantly on click (no progress window for a single quick registry
+    # tweak), while the batch Run Tweaks / Undo Selected Tweaks flow passes
+    # a real log TextBox.
+    $log = { param($Text) if ($OutBox) { $OutBox.AppendText($Text) } }.GetNewClosure()
+
+    $tw = $Tweaks.$TweakId
+    & $log "`r`n=== $(if($Undo){'Undoing'}else{'Applying'}) $($tw.name) ===`r`n"
+
+    if (-not $Undo) {
+        if ($tw.registry) {
+            foreach ($r in $tw.registry) {
+                try { Set-RegistryValue -Path $r.Path -Name $r.Name -Value $r.Value -Type $r.Type }
+                catch { & $log "  registry warn: $($_.Exception.Message)`r`n" }
+            }
+        }
+        if ($tw.service) {
+            foreach ($s in $tw.service) {
+                try { Set-Service -Name $s.Name -StartupType $s.StartupType -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+        if ($tw.apply) {
+            foreach ($block in $tw.apply) {
+                try {
+                    $sb = [ScriptBlock]::Create($block)
+                    Invoke-Command -ScriptBlock $sb | Out-Null
+                } catch { & $log "  script warn: $($_.Exception.Message)`r`n" }
+            }
+        }
+    } else {
+        if ($tw.registry) {
+            foreach ($r in $tw.registry) {
+                try { Set-RegistryValue -Path $r.Path -Name $r.Name -Value $r.OriginalValue -Type $r.Type }
+                catch { & $log "  registry warn: $($_.Exception.Message)`r`n" }
+            }
+        }
+        if ($tw.undo) {
+            foreach ($block in $tw.undo) {
+                try {
+                    $sb = [ScriptBlock]::Create($block)
+                    Invoke-Command -ScriptBlock $sb | Out-Null
+                } catch { & $log "  script warn: $($_.Exception.Message)`r`n" }
+            }
+        }
+    }
+    if ($OutBox) {
+        $OutBox.ScrollToEnd()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
 $TweakCheckboxes = @{}
+# .Suppress is set while programmatically syncing toggle state to the real
+# registry (startup, "Get Installed Tweaks", and the preset buttons) so
+# that doesn't itself trigger the Customize Preferences toggles' instant
+# apply/undo below - only an actual user click should do that.
+$script:ToggleSyncState = @{ Suppress = $false }
+# $script: variables referenced INLINE inside a .GetNewClosure()'d
+# scriptblock body don't reliably resolve against the real script scope at
+# invocation time (confirmed via a trace log: it read back empty, not the
+# value that had actually been set). Wrapping the read in a normal function
+# call - same as Set-RegistryValue/Invoke-Tweak above needing to be defined
+# before Build-TweaksPanelOnce runs, and the same pattern Show-HelpPopup
+# already relies on elsewhere - resolves correctly instead.
+function Test-ToggleSyncSuppressed { return [bool]$script:ToggleSyncState.Suppress }
 $tweaksByCategory = @{}
 foreach ($prop in $Tweaks.PSObject.Properties) {
     $id = $prop.Name
@@ -989,8 +1081,21 @@ function New-TweakToggleRow {
     $toggle.HorizontalAlignment = 'Right'
     $toggle.VerticalAlignment = 'Center'
     $toggle.Tag = $Id
-    $toggle.Add_Checked({ Update-TweakCount })
-    $toggle.Add_Unchecked({ Update-TweakCount })
+    $toggleId = $Id
+    # Customize Preferences toggles behave like real OS settings switches -
+    # flipping one applies (or undoes) it immediately, unlike the
+    # Essential/Advanced checkboxes on the left which only get applied in
+    # a batch once "Run Tweaks" is clicked.
+    $toggle.Add_Checked({
+        Update-TweakCount
+        if (Test-ToggleSyncSuppressed) { return }
+        try { Invoke-Tweak -TweakId $toggleId } catch {}
+    }.GetNewClosure())
+    $toggle.Add_Unchecked({
+        Update-TweakCount
+        if (Test-ToggleSyncSuppressed) { return }
+        try { Invoke-Tweak -TweakId $toggleId -Undo } catch {}
+    }.GetNewClosure())
     $TweakCheckboxes[$Id] = $toggle
     $row.Children.Add($labelStack) | Out-Null
     $row.Children.Add($toggle) | Out-Null
@@ -1081,8 +1186,18 @@ $MinimalTweakIds = @('WPFTweaksConsumerFeatures','WPFTweaksTelemetry','WPFTweaks
 
 function Select-TweakPreset {
     param([string[]]$Ids)
-    foreach ($kv in $TweakCheckboxes.GetEnumerator()) { $kv.Value.IsChecked = $false }
-    foreach ($id in $Ids) { if ($TweakCheckboxes.ContainsKey($id)) { $TweakCheckboxes[$id].IsChecked = $true } }
+    # The presets (Standard/Minimal/Advanced/Clear) only ever pick from
+    # Essential/Advanced tweak ids, never Customize Preferences toggles -
+    # but this still unconditionally unchecks every checkbox, toggles
+    # included, so without suppressing it a preset click would silently
+    # undo every currently-active toggle (Dark Theme, etc.) as a side effect.
+    $script:ToggleSyncState.Suppress = $true
+    try {
+        foreach ($kv in $TweakCheckboxes.GetEnumerator()) { $kv.Value.IsChecked = $false }
+        foreach ($id in $Ids) { if ($TweakCheckboxes.ContainsKey($id)) { $TweakCheckboxes[$id].IsChecked = $true } }
+    } finally {
+        $script:ToggleSyncState.Suppress = $false
+    }
     Update-TweakCount
 }
 
@@ -1118,9 +1233,14 @@ function Test-TweakApplied {
 }
 
 function Sync-TweaksToSystemState {
-    foreach ($kv in $TweakCheckboxes.GetEnumerator()) {
-        $tw = $Tweaks.($kv.Key)
-        try { $kv.Value.IsChecked = (Test-TweakApplied -Tw $tw) } catch { $kv.Value.IsChecked = $false }
+    $script:ToggleSyncState.Suppress = $true
+    try {
+        foreach ($kv in $TweakCheckboxes.GetEnumerator()) {
+            $tw = $Tweaks.($kv.Key)
+            try { $kv.Value.IsChecked = (Test-TweakApplied -Tw $tw) } catch { $kv.Value.IsChecked = $false }
+        }
+    } finally {
+        $script:ToggleSyncState.Suppress = $false
     }
     Update-TweakCount
 }
@@ -1406,71 +1526,6 @@ $ctrl.UninstallSelectedBtn.Add_Click({
     $ids = $AppCheckboxes.GetEnumerator() | Where-Object { $_.Value.IsChecked } | ForEach-Object { $_.Key }
     Run-WingetJob -Ids $ids -Uninstall
 })
-
-# ---------------------------------------------------------------------------
-# Apply / Undo tweaks
-# ---------------------------------------------------------------------------
-function Set-RegistryValue {
-    param($Path, $Name, $Value, $Type)
-    if ($Value -eq '<RemoveEntry>') {
-        Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
-        return
-    }
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    $propType = switch ($Type) {
-        'DWord'  { 'DWord' }
-        'QWord'  { 'QWord' }
-        'String' { 'String' }
-        default  { 'String' }
-    }
-    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $propType -Force | Out-Null
-}
-
-function Invoke-Tweak {
-    param($TweakId, [switch]$Undo, $OutBox)
-
-    $tw = $Tweaks.$TweakId
-    $OutBox.AppendText("`r`n=== $(if($Undo){'Undoing'}else{'Applying'}) $($tw.name) ===`r`n")
-
-    if (-not $Undo) {
-        if ($tw.registry) {
-            foreach ($r in $tw.registry) {
-                try { Set-RegistryValue -Path $r.Path -Name $r.Name -Value $r.Value -Type $r.Type }
-                catch { $OutBox.AppendText("  registry warn: $($_.Exception.Message)`r`n") }
-            }
-        }
-        if ($tw.service) {
-            foreach ($s in $tw.service) {
-                try { Set-Service -Name $s.Name -StartupType $s.StartupType -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-        if ($tw.apply) {
-            foreach ($block in $tw.apply) {
-                try {
-                    $sb = [ScriptBlock]::Create($block)
-                    Invoke-Command -ScriptBlock $sb | Out-Null
-                } catch { $OutBox.AppendText("  script warn: $($_.Exception.Message)`r`n") }
-            }
-        }
-    } else {
-        if ($tw.registry) {
-            foreach ($r in $tw.registry) {
-                try { Set-RegistryValue -Path $r.Path -Name $r.Name -Value $r.OriginalValue -Type $r.Type }
-                catch { $OutBox.AppendText("  registry warn: $($_.Exception.Message)`r`n") }
-            }
-        }
-        if ($tw.undo) {
-            foreach ($block in $tw.undo) {
-                try {
-                    $sb = [ScriptBlock]::Create($block)
-                    Invoke-Command -ScriptBlock $sb | Out-Null
-                } catch { $OutBox.AppendText("  script warn: $($_.Exception.Message)`r`n") }
-            }
-        }
-    }
-    $OutBox.ScrollToEnd()
-    [System.Windows.Forms.Application]::DoEvents()
-}
 
 function Run-TweaksJob {
     param([string[]]$Ids, [switch]$Undo)
