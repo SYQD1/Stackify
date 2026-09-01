@@ -537,8 +537,17 @@ function Get-BadgeColor { param([string]$Key)
 # wrong/generic through the plain favicon lookup. These get a direct,
 # official high-resolution logo URL instead.
 $IconOverrides = @{
-    'chrome'  = 'https://thumb.wikimedia.org/wikipedia/commons/thumb/e/e1/Google_Chrome_icon_%28February_2022%29.svg/250px-Google_Chrome_icon_%28February_2022%29.svg.png'
-    'firefox' = 'https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a0/Firefox_logo%2C_2019.svg/250px-Firefox_logo%2C_2019.svg.png'
+    'chrome'     = 'https://thumb.wikimedia.org/wikipedia/commons/thumb/e/e1/Google_Chrome_icon_%28February_2022%29.svg/250px-Google_Chrome_icon_%28February_2022%29.svg.png'
+    'firefox'    = 'https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a0/Firefox_logo%2C_2019.svg/250px-Firefox_logo%2C_2019.svg.png'
+    # These four have no favicon.ico at their domain root at all (confirmed
+    # by hand), and/or their catalog `link` is a redirect shortlink (aka.ms)
+    # rather than the product's own site, so domain-based lookup can't work
+    # for them no matter what fallback order is tried. Pointed directly at
+    # a real icon asset from each project instead.
+    'terminal'   = 'https://raw.githubusercontent.com/microsoft/terminal/main/res/terminal.ico'
+    'gimp'       = 'https://www.gimp.org/images/wilber32.png'
+    'klite'      = 'https://www.codecguide.com/mpc_logo.png'
+    'eartrumpet' = 'https://raw.githubusercontent.com/File-New-Project/EarTrumpet/master/EarTrumpet.Package/Assets/Square44x44Logo.altform-unplated_targetsize-256.png'
 }
 
 function Get-AppDomain { param([string]$Link)
@@ -555,24 +564,27 @@ function Get-AppIconKey { param([string]$Id, [string]$Domain)
     return $null
 }
 
+# Try the domain's own favicon.ico first - it's the authoritative source
+# and, empirically, more reliable than Google's proxy: for some sites
+# (irfanview.com is a confirmed case) Google's service returns HTTP 200
+# with a generic placeholder glyph instead of erroring, which a fallback
+# can't catch since nothing ever signals failure. Google's service is still
+# useful as the second attempt for sites with no favicon.ico at their
+# domain root (many modern sites reference their icon via a hashed/CDN path
+# instead) - e.g. videolan.org 404s the direct fetch but Google resolves it.
 function Get-IconDownloadUrl { param([string]$Key)
     if ($Key.StartsWith('app:')) {
         $appId = $Key.Substring(4)
         return $IconOverrides[$appId]
     }
     $domain = $Key.Substring(7)
-    return "https://www.google.com/s2/favicons?sz=64&domain=$domain"
+    return "https://$domain/favicon.ico"
 }
 
-# Google's favicon service 404s (with a generic placeholder image bundled in
-# the body, which WebClient never even sees since it throws on non-2xx) for
-# some real, working sites - e.g. videolan.org (VLC), apparently sites its
-# crawler hasn't indexed. When that happens, fetch the domain's own
-# favicon.ico directly as a second attempt before giving up to a badge.
 function Get-IconFallbackUrl { param([string]$Key)
     if ($Key.StartsWith('app:')) { return $null }
     $domain = $Key.Substring(7)
-    return "https://$domain/favicon.ico"
+    return "https://www.google.com/s2/favicons?sz=64&domain=$domain"
 }
 
 function Get-CachedIconFile { param([string]$Key)
