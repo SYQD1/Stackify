@@ -855,7 +855,7 @@ $ctrl.ShowInstalledBtn.Add_Click({
         if (-not $script:InstalledWingetIds) {
             $script:InstalledWingetIds = New-Object 'System.Collections.Generic.HashSet[string]'
             try {
-                $listOut = Invoke-WingetSilently -ArgList @('list', '--accept-source-agreements')
+                $listOut = (Invoke-WingetSilently -ArgList @('list', '--accept-source-agreements')).Output
                 foreach ($appProp in $Apps.PSObject.Properties) {
                     if ($listOut -match [Regex]::Escape($appProp.Value.winget)) {
                         $script:InstalledWingetIds.Add($appProp.Value.winget) | Out-Null
@@ -878,12 +878,12 @@ $ctrl.UpgradeAllBtn.Add_Click({
     $pw.Status.Text = "Upgrading all applications via $(if($useChoco){'Chocolatey'}else{'WinGet'})..."
     [System.Windows.Forms.Application]::DoEvents()
     try {
-        $out = if ($useChoco) {
+        $result = if ($useChoco) {
             Invoke-ChocoSilently -ArgList @('upgrade', 'all', '-y')
         } else {
             Invoke-WingetSilently -ArgList @('upgrade', '--all', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements')
         }
-        $pw.Log.AppendText($out)
+        $pw.Log.AppendText($result.Output)
     } catch {
         $pw.Log.AppendText("ERROR: $($_.Exception.Message)`r`n")
     }
@@ -1220,7 +1220,7 @@ function Invoke-ProcessSilently {
     $out = $p.StandardOutput.ReadToEnd()
     $err = $p.StandardError.ReadToEnd()
     $p.WaitForExit()
-    return "$out`r`n$err"
+    return @{ Output = "$out`r`n$err"; ExitCode = $p.ExitCode }
 }
 function Invoke-WingetSilently { param([string[]]$ArgList) Invoke-ProcessSilently -FileName 'winget' -ArgList $ArgList }
 function Invoke-ChocoSilently  { param([string[]]$ArgList) Invoke-ProcessSilently -FileName 'choco'  -ArgList $ArgList }
@@ -1246,12 +1246,14 @@ function Run-WingetJob {
     $verb = if ($Uninstall) { 'Uninstalling' } else { 'Installing' }
     $pw = New-ProgressWindow -Title "Stackify - $verb" -Max $Ids.Count
     $done = 0
+    $failed = New-Object System.Collections.Generic.List[string]
 
     foreach ($id in $Ids) {
         $appDef = $Apps.$id
         $pkgId = if ($useChoco) { $appDef.choco } else { $appDef.winget }
         if ($useChoco -and [string]::IsNullOrWhiteSpace($pkgId)) {
             $pw.Log.AppendText("`r`n=== Skipping $($appDef.name) - no Chocolatey package known ===`r`n")
+            $failed.Add($appDef.name) | Out-Null
             $done++; $pw.Bar.Value = $done
             continue
         }
@@ -1262,27 +1264,53 @@ function Run-WingetJob {
 
         try {
             if ($useChoco) {
+                # Chocolatey exit code 0 = success, 1641/3010 = success + reboot needed.
                 $args = if ($Uninstall) { @('uninstall', $pkgId, '-y') } else { @('install', $pkgId, '-y', '--no-progress') }
-                $out = Invoke-ChocoSilently -ArgList $args
+                $result = Invoke-ChocoSilently -ArgList $args
+                $ok = $result.ExitCode -in @(0, 1641, 3010)
             } else {
+                # Deliberately no --scope argument: forcing --scope machine breaks
+                # any package whose manifest only declares a user-scope installer
+                # (very common - Proton Mail, Discord, Spotify, most Electron
+                # apps), since winget has no machine-scope installer to fall
+                # back to for those and the install just silently fails.
+                # Letting winget pick the scope itself (its normal default
+                # behavior) matches what a plain `winget install <id>` does.
                 $args = if ($Uninstall) {
                     @('uninstall', '--id', $pkgId, '-e', '--silent', '--disable-interactivity', '--accept-source-agreements')
                 } else {
-                    @('install', '--id', $pkgId, '-e', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements', '--scope', 'machine')
+                    @('install', '--id', $pkgId, '-e', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements')
                 }
-                $out = Invoke-WingetSilently -ArgList $args
+                $result = Invoke-WingetSilently -ArgList $args
+                # winget: 0 = success, -1978335189 (0x8A15002B) = already installed (uninstall-time no-op is fine).
+                $ok = $result.ExitCode -eq 0 -or ($Uninstall -and $result.ExitCode -eq -1978335212)
             }
-            $pw.Log.AppendText($out)
+            $pw.Log.AppendText($result.Output)
+            if ($ok) {
+                $pw.Log.AppendText("`r`n--- OK ($($appDef.name)) ---`r`n")
+            } else {
+                $pw.Log.AppendText("`r`n--- FAILED ($($appDef.name), exit code $($result.ExitCode)) ---`r`n")
+                $failed.Add($appDef.name) | Out-Null
+            }
         } catch {
             $pw.Log.AppendText("ERROR: $($_.Exception.Message)`r`n")
+            $failed.Add($appDef.name) | Out-Null
         }
         $done++
         $pw.Bar.Value = $done
         $pw.Log.ScrollToEnd()
         [System.Windows.Forms.Application]::DoEvents()
     }
-    $pw.Status.Text = "Done - $done of $($Ids.Count) processed."
+
+    if ($failed.Count -eq 0) {
+        $pw.Status.Text = "Done - all $done succeeded."
+    } else {
+        $pw.Status.Text = "Done - $($done - $failed.Count) of $done succeeded, $($failed.Count) failed."
+    }
     $pw.Log.AppendText("`r`n=== Done ===`r`n")
+    if ($failed.Count -gt 0) {
+        $pw.Log.AppendText("Failed: $($failed -join ', ')`r`n")
+    }
 }
 
 $ctrl.InstallSelectedBtn.Add_Click({
