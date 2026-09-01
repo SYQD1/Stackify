@@ -857,7 +857,8 @@ $ctrl.ShowInstalledBtn.Add_Click({
             try {
                 $listOut = (Invoke-WingetSilently -ArgList @('list', '--accept-source-agreements')).Output
                 foreach ($appProp in $Apps.PSObject.Properties) {
-                    if ($listOut -match [Regex]::Escape($appProp.Value.winget)) {
+                    $matchId = $appProp.Value.winget -replace '^msstore:', ''
+                    if ($listOut -match [Regex]::Escape($matchId)) {
                         $script:InstalledWingetIds.Add($appProp.Value.winget) | Out-Null
                     }
                 }
@@ -1269,6 +1270,18 @@ function Run-WingetJob {
                 $result = Invoke-ChocoSilently -ArgList $args
                 $ok = $result.ExitCode -in @(0, 1641, 3010)
             } else {
+                # A few catalog entries use the "msstore:<id>" convention to
+                # mark a Microsoft Store package (e.g. ChatGPT Desktop,
+                # WhatsApp Desktop). winget's --id flag doesn't understand
+                # that prefix syntax at all ("no package found") - the store
+                # source has to be passed separately via --source.
+                $wingetId = $pkgId
+                $sourceArgs = @()
+                if ($pkgId -like 'msstore:*') {
+                    $wingetId = $pkgId.Substring(8)
+                    $sourceArgs = @('--source', 'msstore')
+                }
+
                 # Deliberately no --scope argument: forcing --scope machine breaks
                 # any package whose manifest only declares a user-scope installer
                 # (very common - Proton Mail, Discord, Spotify, most Electron
@@ -1277,9 +1290,9 @@ function Run-WingetJob {
                 # Letting winget pick the scope itself (its normal default
                 # behavior) matches what a plain `winget install <id>` does.
                 $args = if ($Uninstall) {
-                    @('uninstall', '--id', $pkgId, '-e', '--silent', '--disable-interactivity', '--accept-source-agreements')
+                    @('uninstall', '--id', $wingetId, '-e', '--silent', '--disable-interactivity', '--accept-source-agreements') + $sourceArgs
                 } else {
-                    @('install', '--id', $pkgId, '-e', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements')
+                    @('install', '--id', $wingetId, '-e', '--silent', '--disable-interactivity', '--accept-package-agreements', '--accept-source-agreements') + $sourceArgs
                 }
                 $result = Invoke-WingetSilently -ArgList $args
                 # winget: 0 = success, -1978335189 (0x8A15002B) = already installed (uninstall-time no-op is fine).
