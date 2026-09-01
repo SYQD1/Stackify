@@ -548,6 +548,7 @@ $IconOverrides = @{
     'gimp'       = 'https://www.gimp.org/images/wilber32.png'
     'klite'      = 'https://www.codecguide.com/mpc_logo.png'
     'eartrumpet' = 'https://raw.githubusercontent.com/File-New-Project/EarTrumpet/master/EarTrumpet.Package/Assets/Square44x44Logo.altform-unplated_targetsize-256.png'
+    'qtox'       = 'https://raw.githubusercontent.com/qTox/qTox/master/img/icons/128x128/qtox.png'
 }
 
 function Get-AppDomain { param([string]$Link)
@@ -887,6 +888,7 @@ $ctrl.ShowInstalledBtn.Add_Click({
             try {
                 $listOut = (Invoke-WingetSilently -ArgList @('list', '--accept-source-agreements')).Output
                 foreach ($appProp in $Apps.PSObject.Properties) {
+                    if ([string]::IsNullOrWhiteSpace($appProp.Value.winget)) { continue }
                     $matchId = $appProp.Value.winget -replace '^msstore:', ''
                     if ($listOut -match [Regex]::Escape($matchId)) {
                         $script:InstalledWingetIds.Add($appProp.Value.winget) | Out-Null
@@ -1282,8 +1284,15 @@ function Run-WingetJob {
     foreach ($id in $Ids) {
         $appDef = $Apps.$id
         $pkgId = if ($useChoco) { $appDef.choco } else { $appDef.winget }
-        if ($useChoco -and [string]::IsNullOrWhiteSpace($pkgId)) {
-            $pw.Log.AppendText("`r`n=== Skipping $($appDef.name) - no Chocolatey package known ===`r`n")
+        if ([string]::IsNullOrWhiteSpace($pkgId)) {
+            # A handful of apps (e.g. RustDesk) aren't on WinGet at all, only
+            # Chocolatey, or vice versa - this used to only be checked for
+            # Chocolatey, so picking WinGet for one of those apps would build
+            # an --id argument with nothing after it instead of skipping
+            # cleanly.
+            $mgrName = if ($useChoco) { 'Chocolatey' } else { 'WinGet' }
+            $otherMgrName = if ($useChoco) { 'WinGet' } else { 'Chocolatey' }
+            $pw.Log.AppendText("`r`n=== Skipping $($appDef.name) - no $mgrName package known (try $otherMgrName instead) ===`r`n")
             $failed.Add($appDef.name) | Out-Null
             $done++; $pw.Bar.Value = $done
             continue
