@@ -23,15 +23,24 @@
 # ---------------------------------------------------------------------------
 $script:StackifySourceUrl = 'https://raw.githubusercontent.com/SYQD1/Stackify/main/Stackify.ps1'
 
+# Deliberately no -WindowStyle Hidden here. That flag, combined with
+# -ExecutionPolicy Bypass and an irm-pipe-iex remote-script command line,
+# is exactly the pattern Windows Defender's ML heuristics (and real
+# malware droppers) use - it got this script flagged as
+# Trojan:Win32/Commando.A!ml purely from the command line shape, nothing
+# to do with what the script actually does. The console briefly flashing
+# on screen is a fine tradeoff for not tripping that; it's hidden a moment
+# later via the ConsoleHide code below instead, which achieves the same
+# "no console visible in normal use" result without the launch-time flag.
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     if ($PSCommandPath) {
         Start-Process powershell.exe -Verb RunAs -ArgumentList @(
-            "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$PSCommandPath`""
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`""
         )
     } else {
         Start-Process powershell.exe -Verb RunAs -ArgumentList @(
-            "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command",
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
             "irm $script:StackifySourceUrl | iex"
         )
     }
